@@ -23,7 +23,7 @@
 ### 1. Клонируйте / распакуйте проект
 
 ```bash
-cd chatbot
+git clone https://github.com/SelVord/chatbot.git
 ```
 
 ### 2. Создайте виртуальное окружение
