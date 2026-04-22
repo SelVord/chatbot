@@ -69,7 +69,10 @@ EMBEDDING_PROVIDER=local
 ### 5. (Опционально) Установите Ollama для локальной работы
 
 ```bash
-# Установка: https://ollama.com
+1. Download ollama from https://ollama.com
+
+2. Paste this in Powershell:
+
 ollama pull llama3.2
 ollama serve
 ```
