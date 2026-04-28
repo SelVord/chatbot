@@ -11,7 +11,7 @@ from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
 
 import config
-from core.embeddings import get_embeddings
+from .embeddings import get_embeddings
 
 
 def _store_path(session_id: int) -> Path:

@@ -37,7 +37,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS sessions (
             id                INTEGER PRIMARY KEY AUTOINCREMENT,
             name              TEXT    NOT NULL,
-            bot_name          TEXT    NOT NULL DEFAULT 'Ассистент',
+            bot_name          TEXT    NOT NULL DEFAULT 'Assistant',
             system_prompt     TEXT    NOT NULL DEFAULT '',
             vector_store_path TEXT    NOT NULL DEFAULT '',
             llm_provider      TEXT    NOT NULL DEFAULT 'openai',

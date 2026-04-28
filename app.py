@@ -4,8 +4,14 @@ Run: streamlit run app.py
 """
 
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Make data/core/ importable as the `core` package
+_data_dir = Path(__file__).parent / "data"
+if str(_data_dir) not in sys.path:
+    sys.path.insert(0, str(_data_dir))
 
 import streamlit as st
 
@@ -13,7 +19,7 @@ import config
 import core.database as db
 import core.document_processor as dp
 import core.vector_store as vs
-from core.rag_chain import ask
+from core.rag_chain import ask_stream
 
 # ══════════════════════════════════════════════════════════════════════
 # Page config
@@ -205,6 +211,7 @@ for key, default in [
     ("vector_store", None),
     ("messages", []),
     ("relevance_threshold", config.RELEVANCE_THRESHOLD),
+    ("editing_doc", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -239,7 +246,47 @@ def index_chunks(chunks, session_id, session):
     store = vs.add_to_vector_store(
         session_id, chunks, embedding_provider=session["embedding_provider"]
     )
-    st.session_state.vector_store = store   # ← key fix: always refresh state
+    st.session_state.vector_store = store
+
+
+def get_ollama_models() -> list[str]:
+    """Fetch available Ollama models from the local server, without :latest suffix."""
+    try:
+        import requests
+        resp = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=3)
+        if resp.status_code == 200:
+            models = [
+                m["name"].removesuffix(":latest")
+                for m in resp.json().get("models", [])
+            ]
+            if models:
+                return models
+    except Exception:
+        pass
+    return [config.OLLAMA_MODEL]
+
+
+def rebuild_session_index(session_id: int, session: dict) -> None:
+    """Rebuild the FAISS index from all saved files for a session."""
+    docs = db.get_documents(session_id)
+    all_chunks = []
+    for doc in docs:
+        file_path = config.UPLOADS_DIR / doc["filename"]
+        if file_path.exists():
+            try:
+                chunks, _ = dp.load_and_split(str(file_path))
+                all_chunks.extend(chunks)
+            except Exception:
+                pass
+    vs.delete_vector_store(session_id)
+    if all_chunks:
+        store = vs.build_vector_store(
+            session_id, all_chunks,
+            embedding_provider=session["embedding_provider"],
+        )
+        st.session_state.vector_store = store
+    else:
+        st.session_state.vector_store = None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -261,10 +308,15 @@ with st.sidebar:
     with col_add:
         if st.button("➕", help="Create session", use_container_width=True):
             if new_name.strip():
+                _default_model = (
+                    config.OPENAI_MODEL
+                    if config.LLM_PROVIDER == "openai"
+                    else config.OLLAMA_MODEL
+                )
                 sid = db.create_session(
                     name=new_name.strip(),
                     llm_provider=config.LLM_PROVIDER,
-                    llm_model=config.OPENAI_MODEL,
+                    llm_model=_default_model,
                     embedding_provider=config.EMBEDDING_PROVIDER,
                 )
                 load_session(sid)
@@ -273,17 +325,23 @@ with st.sidebar:
                 st.error("Enter a session name")
 
     if sessions:
-        current_idx = next(
-            (i for i, s in enumerate(sessions) if s["id"] == st.session_state.session_id), 0
-        )
+        # None option keeps the app in "no session" state on first load
+        _options = [None] + [s["id"] for s in sessions]
+        if st.session_state.session_id is None:
+            _cur = 0
+        else:
+            _cur = next(
+                (i + 1 for i, s in enumerate(sessions) if s["id"] == st.session_state.session_id),
+                0,
+            )
         selected_id = st.selectbox(
             "Session",
-            options=[s["id"] for s in sessions],
-            format_func=lambda i: sid_to_name[i],
-            index=current_idx,
+            options=_options,
+            format_func=lambda i: "— select a session —" if i is None else sid_to_name[i],
+            index=_cur,
             label_visibility="collapsed",
         )
-        if selected_id != st.session_state.session_id:
+        if selected_id is not None and selected_id != st.session_state.session_id:
             load_session(selected_id)
             st.rerun()
 
@@ -307,11 +365,19 @@ with st.sidebar:
                 ["openai", "ollama"],
                 index=0 if session["llm_provider"] == "openai" else 1,
             )
-            llm_model = st.text_input(
-                "Model name",
-                value=session["llm_model"],
-                help="e.g. gpt-4o-mini or llama3.2",
-            )
+            # provider just changed → reset the saved model so we never
+            # carry an OpenAI model name into Ollama or vice-versa
+            _provider_changed = llm_provider != session["llm_provider"]
+            if llm_provider == "openai":
+                _openai_models = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"]
+                _saved = session["llm_model"] if not _provider_changed else "gpt-4o-mini"
+                _model_idx = _openai_models.index(_saved) if _saved in _openai_models else 0
+                llm_model = st.selectbox("Model", _openai_models, index=_model_idx)
+            else:
+                _ollama_models = get_ollama_models()
+                _saved = session["llm_model"] if not _provider_changed else _ollama_models[0]
+                _model_idx = _ollama_models.index(_saved) if _saved in _ollama_models else 0
+                llm_model = st.selectbox("Model", _ollama_models, index=_model_idx)
             emb_provider = st.selectbox(
                 "Embeddings",
                 ["openai", "local"],
@@ -348,17 +414,57 @@ with st.sidebar:
         docs = db.get_documents(st.session_state.session_id)
         if docs:
             for doc in docs:
-                st.markdown(
-                    f'<span class="doc-chip">📎 {doc["filename"]} '
-                    f'({doc["page_count"]}p · {doc["chunk_count"]} chunks)</span>',
-                    unsafe_allow_html=True,
-                )
+                _fp = config.UPLOADS_DIR / doc["filename"]
+                _editable = doc["filename"].endswith(".txt") and _fp.exists()
+                if _editable:
+                    _c1, _c2 = st.columns([5, 1])
+                    _c1.markdown(
+                        f'<span class="doc-chip">📎 {doc["filename"]} '
+                        f'({doc["page_count"]}p · {doc["chunk_count"]} chunks)</span>',
+                        unsafe_allow_html=True,
+                    )
+                    if _c2.button("✏️", key=f"edit_{doc['id']}", help="View / Edit"):
+                        st.session_state.editing_doc = (
+                            None if st.session_state.editing_doc == doc["id"] else doc["id"]
+                        )
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f'<span class="doc-chip">📎 {doc["filename"]} '
+                        f'({doc["page_count"]}p · {doc["chunk_count"]} chunks)</span>',
+                        unsafe_allow_html=True,
+                    )
+                # Inline editor (shown when this doc is selected)
+                if st.session_state.editing_doc == doc["id"] and _editable:
+                    _current = _fp.read_text(encoding="utf-8")
+                    _new = st.text_area(
+                        f"Editing: {doc['filename']}",
+                        value=_current,
+                        height=220,
+                        key=f"ta_{doc['id']}",
+                    )
+                    _s1, _s2 = st.columns(2)
+                    if _s1.button("💾 Save & Re-index", key=f"save_{doc['id']}", type="primary", use_container_width=True):
+                        _fp.write_text(_new, encoding="utf-8")
+                        rebuild_session_index(st.session_state.session_id, current_session())
+                        st.session_state.editing_doc = None
+                        st.success("Saved and re-indexed!")
+                        st.rerun()
+                    if _s2.button("✖ Cancel", key=f"cancel_{doc['id']}", use_container_width=True):
+                        st.session_state.editing_doc = None
+                        st.rerun()
         else:
             st.caption("No documents yet.")
 
-        doc_tab, text_tab = st.tabs(["📁 Upload file", "✏️ Paste text"])
+        upload_mode = st.radio(
+            "Add knowledge",
+            ["📁 Upload file", "✏️ Paste text"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="upload_mode",
+        )
 
-        with doc_tab:
+        if upload_mode == "📁 Upload file":
             uploaded_files = st.file_uploader(
                 "Upload files",
                 type=["pdf", "txt", "docx"],
@@ -391,7 +497,7 @@ with st.sidebar:
                     st.success(f"✅ Indexed {ok_count} file(s)!")
                     st.rerun()
 
-        with text_tab:
+        else:
             paste_label = st.text_input(
                 "Source label (optional)",
                 placeholder="e.g. Company FAQ",
@@ -407,13 +513,17 @@ with st.sidebar:
                 if paste_text.strip():
                     session = current_session()
                     label = paste_label.strip() or "pasted_text"
+                    filename = label if label.endswith(".txt") else f"{label}.txt"
                     try:
                         with st.spinner("Indexing text…"):
+                            # Save to disk so the text is editable later
+                            _text_path = config.UPLOADS_DIR / filename
+                            _text_path.write_text(paste_text.strip(), encoding="utf-8")
                             chunks, pages = dp.load_and_split_text(paste_text.strip(), source_name=label)
                             index_chunks(chunks, st.session_state.session_id, session)
                             db.save_document(
                                 st.session_state.session_id,
-                                label, pages, len(chunks),
+                                filename, pages, len(chunks),
                             )
                         st.success(f"✅ Indexed {len(chunks)} chunks!")
                         st.rerun()
@@ -421,6 +531,31 @@ with st.sidebar:
                         st.error(f"Error: {e}")
                 else:
                     st.warning("Please paste some text first.")
+
+        # ── Export bot ─────────────────────────────────────────────────
+        st.divider()
+        st.markdown("### 📦 Export Bot")
+        if vs.has_vector_store(st.session_state.session_id):
+            st.caption(
+                "Downloads a ready-to-deploy package: FastAPI server, "
+                "chat widget, FAISS index, and setup instructions."
+            )
+            _exp_session = current_session()
+            _exp_name = "".join(
+                c if c.isalnum() else "_"
+                for c in _exp_session["name"]
+            ).lower()
+            from core.export import create_export_zip
+            st.download_button(
+                "⬇️ Download export package (ZIP)",
+                data=create_export_zip(st.session_state.session_id, _exp_session),
+                file_name=f"{_exp_name}_bot.zip",
+                mime="application/zip",
+                use_container_width=True,
+                type="primary",
+            )
+        else:
+            st.caption("Index at least one document to enable export.")
 
         # ── Danger zone ────────────────────────────────────────────────
         st.divider()
@@ -458,7 +593,7 @@ if st.session_state.session_id is None:
         <div style="font-size:3em;">🤖</div>
         <h2 style="color:#e8eaf0;">Welcome to RAG Chatbot</h2>
         <p style="color:#6b7280; font-size:1.05em;">
-            Create a session in the sidebar →<br>
+            Create a session in the sidebar &#8594;<br>
             Upload documents, then start chatting.
         </p>
     </div>
@@ -503,8 +638,10 @@ for msg in st.session_state.messages:
                     )
 
 # ── Input ───────────────────────────────────────────────────────────
-placeholder = "Ask a question about your documents…" if has_index else "Index documents first…"
-question = st.chat_input(placeholder=placeholder, disabled=not has_index)
+if has_index:
+    question = st.chat_input(placeholder="Ask a question about your documents…")
+else:
+    question = None
 
 if question:
     with st.chat_message("user"):
@@ -514,17 +651,25 @@ if question:
     st.session_state.messages.append({"role": "user", "content": question, "sources": []})
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking…"):
-            session = current_session()
-            answer, sources = ask(
-                question=question,
-                vector_store=st.session_state.vector_store,
-                session=session,
-                history=st.session_state.messages[:-1],
-                threshold=st.session_state.relevance_threshold,
-            )
+        session = current_session()
+        response_area = st.empty()
+        answer = ""
+        sources: list = []
 
-        st.markdown(answer)
+        for chunk, src in ask_stream(
+            question=question,
+            vector_store=st.session_state.vector_store,
+            session=session,
+            history=st.session_state.messages[:-1],
+            threshold=st.session_state.relevance_threshold,
+        ):
+            if src is not None:
+                sources = src
+            else:
+                answer += chunk
+                response_area.markdown(answer + "▌")
+
+        response_area.markdown(answer)
 
         if sources:
             with st.expander(f"📚 Sources ({len(sources)})"):

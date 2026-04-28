@@ -37,17 +37,18 @@ CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K_DOCS = 5
 # Relevance threshold (0–1). Below this → bot says "I don't know".
-RELEVANCE_THRESHOLD = 0.30
+RELEVANCE_THRESHOLD = 0.20
 # How many last message-pairs to include as conversation context
 MAX_HISTORY_PAIRS = 4
 
 # ── UI defaults ────────────────────────────────────────────────────────
-DEFAULT_BOT_NAME = "Ассистент"
+DEFAULT_BOT_NAME = "Assistant"
 DEFAULT_SYSTEM_PROMPT = (
-    "Ты — полезный ассистент. Отвечай строго на основе предоставленных документов. "
-    "Если информации нет — честно скажи об этом."
+    "You are a helpful assistant. Answer strictly based on the provided information or documents. "
+    "Be concise, clear, and stay focused only on topics covered in your knowledge base. "
+    "If the information is not available, say so honestly."
 )
 NO_CONTEXT_REPLY = (
-    "❌ Я не нашёл в документах информации по этому вопросу. "
-    "Попробуйте переформулировать или загрузите нужные документы."
+    "❌ I could not find relevant information in the documents for this question. "
+    "Try rephrasing your question or upload the relevant documents."
 )
